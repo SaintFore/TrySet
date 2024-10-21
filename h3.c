@@ -1,99 +1,132 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <semaphore.h>
 #include <fcntl.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <string.h>
 
 #define STORE_PATH "/tmp/store"
-#define MAX_CAPACITY 100
+#define STORE_SIZE 100
 
-sem_t empty;
-sem_t full;
-pthread_mutex_t mutex;
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
 
-void* producer(void* arg) {
-    char resource[] = "1234567890";
-    int index = 0;
-
-    while (1) {
-        sem_wait(&empty);
-        pthread_mutex_lock(&mutex);
-
-        FILE* f = fopen(STORE_PATH, "a+");
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        if (size < MAX_CAPACITY) {
-            fputc(resource[index], f);
-            index = (index + 1) % strlen(resource);
-            fseek(f, 0, SEEK_END);
-            long new_size = ftell(f);
-            printf("生产前: %ld bytes, 空位: %ld bytes\n", size, MAX_CAPACITY - size);
-            printf("生产后: %ld bytes, 空位: %ld bytes\n", new_size, MAX_CAPACITY - new_size);
-            printf("生产资源: %c\n", resource[index]);
-        }
-        fclose(f);
-
-        pthread_mutex_unlock(&mutex);
-        sem_post(&full);
-        sleep(1);
+void init_store() {
+    int fd = open(STORE_PATH, O_CREAT | O_TRUNC | O_WRONLY, 0666);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
     }
-    return NULL;
+    char buffer[STORE_SIZE] = {0};
+    write(fd, buffer, STORE_SIZE);
+    close(fd);
 }
 
-void* consumer(void* arg) {
+void producer(int semid) {
+    int fd = open(STORE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+    struct sembuf sem_op;
+    char resource = '1';
     while (1) {
-        sem_wait(&full);
-        pthread_mutex_lock(&mutex);
+        sem_op.sem_num = 0;
+        sem_op.sem_op = -1;
+        sem_op.sem_flg = 0;
+        semop(semid, &sem_op, 1);
 
-        FILE* f = fopen(STORE_PATH, "r+");
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        if (size > 0) {
-            fseek(f, 0, SEEK_SET);
-            char consumed = fgetc(f);
-            char buffer[MAX_CAPACITY];
-            fread(buffer, 1, size - 1, f);
-            freopen(STORE_PATH, "w", f);
-            fwrite(buffer, 1, size - 1, f);
-            fseek(f, 0, SEEK_END);
-            long new_size = ftell(f);
-            printf("消费前: %ld bytes, 空位: %ld bytes\n", size, MAX_CAPACITY - size);
-            printf("消费后: %ld bytes, 空位: %ld bytes\n", new_size, MAX_CAPACITY - new_size);
-            printf("消费资源: %c\n", consumed);
+        lseek(fd, 0, SEEK_SET);
+        char buffer[STORE_SIZE];
+        read(fd, buffer, STORE_SIZE);
+        int count = 0;
+        for (int i = 0; i < STORE_SIZE; i++) {
+            if (buffer[i] != 0) count++;
         }
-        fclose(f);
+        if (count < STORE_SIZE) {
+            printf("生产前: 资源数量=%d, 空位数量=%d\n", count, STORE_SIZE - count);
+            buffer[count] = resource;
+            lseek(fd, 0, SEEK_SET);
+            write(fd, buffer, STORE_SIZE);
+            printf("生产后: 资源数量=%d, 空位数量=%d, 生产资源=%c\n", count + 1, STORE_SIZE - count - 1, resource);
+            resource = (resource == '9') ? '0' : resource + 1;
+        }
 
-        pthread_mutex_unlock(&mutex);
-        sem_post(&empty);
+        sem_op.sem_op = 1;
+        semop(semid, &sem_op, 1);
+        sleep(1);
+    }
+    close(fd);
+}
+
+void consumer(int semid) {
+    int fd = open(STORE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+    struct sembuf sem_op;
+    while (1) {
+        sem_op.sem_num = 0;
+        sem_op.sem_op = -1;
+        sem_op.sem_flg = 0;
+        semop(semid, &sem_op, 1);
+
+        lseek(fd, 0, SEEK_SET);
+        char buffer[STORE_SIZE];
+        read(fd, buffer, STORE_SIZE);
+        int count = 0;
+        for (int i = 0; i < STORE_SIZE; i++) {
+            if (buffer[i] != 0) count++;
+        }
+        if (count > 0) {
+            printf("消费前: 资源数量=%d, 空位数量=%d\n", count, STORE_SIZE - count);
+            char consumed = buffer[0];
+            memmove(buffer, buffer + 1, STORE_SIZE - 1);
+            buffer[STORE_SIZE - 1] = 0;
+            lseek(fd, 0, SEEK_SET);
+            write(fd, buffer, STORE_SIZE);
+            printf("消费后: 资源数量=%d, 空位数量=%d, 消费资源=%c\n", count - 1, STORE_SIZE - count + 1, consumed);
+        }
+
+        sem_op.sem_op = 1;
+        semop(semid, &sem_op, 1);
         sleep(2);
     }
-    return NULL;
+    close(fd);
 }
 
 int main() {
-    // 创建或清空文件
-    FILE* f = fopen(STORE_PATH, "w");
-    fclose(f);
+    key_t key = ftok(STORE_PATH, 'a');
+    int semid = semget(key, 1, IPC_CREAT | 0666);
+    if (semid < 0) {
+        perror("semget");
+        exit(1);
+    }
+    union semun sem_union;
+    sem_union.val = 1;
+    if (semctl(semid, 0, SETVAL, sem_union) < 0) {
+        perror("semctl");
+        exit(1);
+    }
 
-    // 初始化信号量和互斥锁
-    sem_init(&empty, 0, MAX_CAPACITY);
-    sem_init(&full, 0, 0);
-    pthread_mutex_init(&mutex, NULL);
+    init_store();
 
-    // 启动生产者和消费者线程
-    pthread_t producer_thread, consumer_thread;
-    pthread_create(&producer_thread, NULL, producer, NULL);
-    pthread_create(&consumer_thread, NULL, consumer, NULL);
-
-    pthread_join(producer_thread, NULL);
-    pthread_join(consumer_thread, NULL);
-
-    // 销毁信号量和互斥锁
-    sem_destroy(&empty);
-    sem_destroy(&full);
-    pthread_mutex_destroy(&mutex);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    } else if (pid == 0) {
+        producer(semid);
+    } else {
+        consumer(semid);
+    }
 
     return 0;
 }
